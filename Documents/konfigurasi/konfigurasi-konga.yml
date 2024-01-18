@@ -1,0 +1,16 @@
+# Install Konga
+# Add repository
+$ helm repo add konga https://lakshanmamalgaha96.github.io/konga-helm
+# Unduh helm chart.
+$ helm pull konga/konga --version 1.1.0
+# Ekstrak file.
+$ tar -zxvf konga-1.1.0.tgz
+# Edit file values.yaml:
+service:
+  type: NodePort
+  port: 3000
+# Install chart.
+$ helm install my-konga konga/konga --version 1.1.0
+$ export NODE_PORT=$(kubectl get --namespace default -o jsonpath="{.spec.ports[0].nodePort}" services my-konga)
+$ export NODE_IP=$(kubectl get nodes --namespace default -o jsonpath="{.items[0].status.addresses[0].address}")
+$ echo http://$NODE_IP:$NODE_PORT

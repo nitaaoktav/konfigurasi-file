@@ -1,0 +1,244 @@
+# Install Kong on Kubernetes With Helm
+# Install Kong Gateway
+# Helm Setup
+# Kong menyediakan chart Helm untuk deploying Kong Gateway. Tambahkan repository chart.konghq.com dan jalankan helm repo update untuk memastikan bahwa Anda memiliki versi chart terbaru.
+$ helm repo add kong https://charts.konghq.com
+$ helm repo update
+
+# Secret (Kong Gateway Enterprise License)
+# Buat namespace kong.
+$ kubectl create namespace kong
+# Selanjutnya, buat secret license Kong Gateway Enterprise:
+$ kubectl create secret generic kong-enterprise-license --from-literal=license="'{}'" -n kong
+
+# Clustring Certificates
+# Kong Gateway menggunakan mTLS untuk mengamankan komunikasi control plane/data plane data saat dijalankan dalam hybrid mode.
+# Generate TLS Certificate menggunakan OpenSSL:
+$ openssl req -new -x509 -nodes -newkey ec:<(openssl ecparam -name secp384r1) -keyout ./tls.key -out ./tls.crt -days 1095 -subj "/CN=kong_clustering"
+# Buat Kubernetes secret.
+$ kubectl create secret tls kong-cluster-cert --cert=./tls.crt --key=./tls.key -n kong
+
+# Installation
+# Control plane berisi semua konfigurasi kong gateway. Konfigurasi disimpan dalam database PostgreSQL.
+# Buat file values-cp.yaml: 
+# Do not use Kong Ingress Controller
+ingressController:
+  enabled: false
+
+image:
+  repository: kong/kong-gateway
+  tag: "3.5.0.2"
+
+# Mount the secret created earlier
+secretVolumes:
+  - kong-cluster-cert
+
+env:
+  # This is a control_plane node
+  role: control_plane
+  # These certificates are used for control plane / data plane communication
+  cluster_cert: /etc/secrets/kong-cluster-cert/tls.crt
+  cluster_cert_key: /etc/secrets/kong-cluster-cert/tls.key
+
+  # Database
+  # CHANGE THESE VALUES
+  database: postgres
+  pg_database: kong
+  pg_user: kong
+  pg_password: demo123
+  pg_host: kong-cp-postgresql.kong.svc.cluster.local
+  pg_ssl: "on"
+
+  # Kong Manager password
+  password: kong_admin_password
+
+# Enable enterprise functionality
+enterprise:
+  enabled: true
+  license_secret: kong-enterprise-license
+
+# The control plane serves the Admin API
+admin:
+  enabled: true
+  http:
+    enabled: true
+
+# Clustering endpoints are required in hybrid mode
+cluster:
+  enabled: true
+  tls:
+    enabled: true
+
+clustertelemetry:
+  enabled: true
+  tls:
+    enabled: true
+
+# Optional features
+manager:
+  enabled: false
+
+portal:
+  enabled: false
+
+portalapi:
+  enabled: false
+
+# These roles will be served by different Helm releases
+proxy:
+  enabled: false
+
+# (Opsional) Jika Anda ingin menerapkan database Postgres dalam klaster untuk tujuan pengujian, tambahkan kode berikut ke bagian bawah value-cp.yaml.
+# This is for testing purposes only
+# DO NOT DO THIS IN PRODUCTION
+# Your cluster needs a way to create PersistantVolumeClaims
+# if this option is enabled
+postgresql:
+  enabled: true
+  auth:
+    password: demo123
+
+# Perbarui value koneksi databade di values-cp.yaml.
+env.pg_database: Nama database yang akan digunakan.
+env.pg_user: Nama user database
+env.pg_password: Kata sandi database
+env.pg_host: Nama host database Postgres
+env.pg_ssl: Gunakan SSL untuk terhubung ke database
+
+# Tetapkan kata sandi admin Kong Manager di valeus-cp.yaml.
+env.password: Kata sandi admin Kong Manager.
+
+# Run helm install.
+$ helm install kong-cp kong/kong -n kong --values ./values-cp.yaml
+
+# Data Plane
+# Data plane Kong Gateway bertanggung jawab untuk memproses traffic masuk. Ia menerima konfigurasi routing dari control plane menggunakan clustering endpoint.
+# Buat file values-dp.yaml:
+# Do not use Kong Ingress Controller
+ingressController:
+  enabled: false
+
+image:
+  repository: kong/kong-gateway
+  tag: "3.5.0.2"
+
+# Mount the secret created earlier
+secretVolumes:
+  - kong-cluster-cert
+
+env:
+  # data_plane nodes do not have a database
+  role: data_plane
+  database: "off"
+
+  # Tell the data plane how to connect to the control plane
+  cluster_control_plane: kong-cp-kong-cluster.kong.svc.cluster.local:8005
+  cluster_telemetry_endpoint: kong-cp-kong-clustertelemetry.kong.svc.cluster.local:8006
+
+  # Configure control plane / data plane authentication
+  lua_ssl_trusted_certificate: /etc/secrets/kong-cluster-cert/tls.crt
+  cluster_cert: /etc/secrets/kong-cluster-cert/tls.crt
+  cluster_cert_key: /etc/secrets/kong-cluster-cert/tls.key
+
+# Enable enterprise functionality
+enterprise:
+  enabled: true
+  license_secret: kong-enterprise-license
+
+# The data plane handles proxy traffic only
+proxy:
+  enabled: true
+
+# These roles are served by the kong-cp deployment
+admin:
+  enabled: false
+
+portal:
+  enabled: false
+
+portalapi:
+  enabled: false
+
+manager:
+  enabled: false
+
+# Jalankan helm install.
+$ helm install kong-dp kong/kong -n kong --values ./values-dp.yaml
+
+# Testing
+# Kong Gateway sekarang sedang berjalan. Untuk mengirimkan beberapa test traffic, coba yang berikut ini:
+# Ambil alamat LoadBalancer untuk service kong-dp dan simpan di environment variable PROXY_IP
+$ PROXY_IP=$(kubectl get service --namespace kong kong-dp-kong-proxy -o jsonpath='{range .status.loadBalancer.ingress[0]}{@.ip}{@.hostname}{end}')
+# Buat request HTTP ke $PROXY_IP. Ini akan mengembalikan HTTP 404 yang di served oleh Kong Gateway.
+$ curl $PROXY_IP/mock/anything
+# Di terminal lain, jalankan kubectl port-forward untuk mengatur penerusan port dan mengakses API admin.
+$ kubectl port-forward -n kong service/kong-cp-kong-admin 8001
+# Buat mock service dan route.
+$ curl localhost:8001/services -d name=mock  -d url="http://httpbin.org"
+$ curl localhost:8001/services/mock/routes -d "paths=/mock"
+# Buat request HTTP ke $PROXY_IP lagi. Kali ini Kong Gateway akan merutekan permintaan tersebut ke httpbin.
+$ curl $PROXY_IP/mock/anything
+{
+  "args": {}, 
+  "data": "", 
+  "files": {}, 
+  "form": {}, 
+  "headers": {
+    "Accept": "*/*", 
+    "Host": "httpbin.org", 
+    "User-Agent": "curl/8.1.2", 
+    "X-Amzn-Trace-Id": "Root=1-65a77560-75becc416ea7ef6f217836b6", 
+    "X-Forwarded-Host": "10.108.189.36", 
+    "X-Forwarded-Path": "/mock/anything", 
+    "X-Forwarded-Prefix": "/mock", 
+    "X-Kong-Request-Id": "20981b57e49d14131b8c0c5af3e2e914"
+  }, 
+  "json": null, 
+  "method": "GET", 
+  "origin": "10.244.0.1, 36.78.74.255", 
+  "url": "http://10.108.189.36/anything"
+}
+
+# Install Kong Manager
+# Installation
+# Kong Manager dilayani dari node yang sama dengan Admin API. untuk mengaktifkan Kong Manager, lakukan perubahan berikut pada file value-cp.yaml.
+# Set admin_gui_url,admin_gui_api_url dan admin_gui_session_conf di bawah env key.
+ # Additional configuration for Kong Manager
+  admin_gui_url: http://192.168.64.4:32288
+  admin_gui_api_url: http://192.168.64.4:31760
+  admin_gui_session_conf: '{"secret":"secret","storage":"kong","cookie_secure":false}'
+
+# Aktifkan autentikan Kong Manager di bawah enterprise key.
+# Enable enterprise functionality
+enterprise:
+  enabled: true
+  license_secret: kong-enterprise-license
+  rbac:
+    enabled: true
+    admin_gui_auth: basic-auth
+
+# Konfigurasikan Manager di values-cp.yaml.
+# Optional features
+manager:
+  enabled: true
+  http:
+    enabled: true
+  ingress:
+    enabled: false
+  service:
+    type: NodePort
+
+# Jalankan helm upgrade untuk meperbarui release.
+$ helm upgrade kong-cp kong/kong -n kong --values ./values-cp.yaml
+
+# Penjelasan Komponen:
+Control Plane (kong-cp): Bertanggung jawab untuk menyimpan konfigurasi dan mneyajikan Admin API serta Clustering Endpoint untuk data plane.
+Data Plane (kond-dp): Bertanggung jawab untuk memperoses traffic masuk sesuai dengan konfigurasi yang diterima dari control plane.
+Kong Manager: User Interface untuk mengelola dan memonitoring Kong Gateway
+Helm Chart ('values-cp.yaml' dan 'values-dp.yaml'): Konfigurasi Helm untuk menyesuaikan installasi Kong Gateway sesuai kebutuhan dan kebijakan.
+
+# Alur Kerja:
+Control Plane berkomunikasi dengan Data Plane melalui Clustering Endpoint menggunakan mTLS.
+Konfigurasi disimpan di database PostgreSQL pada Control Plane.
+Data Plane konfigurasi dari Control Plane dan menerapkan aturan routing.
+Kong Manager memberikan user interface untuk administrasi dan konfiguras.

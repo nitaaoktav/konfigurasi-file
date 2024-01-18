@@ -1,0 +1,7 @@
+# Install kuma
+$ helm repo add kuma https://kumahq.github.io/charts
+# Install chart:
+$ helm install my-kuma kuma/kuma --version 2.5.1
+# Add service NodePort
+$ kubectl expose service kuma-control-plane -n default --type=NodePort --name=kuma-nodeport 
+$ minikube service kuma-nodeport -n default
